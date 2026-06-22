@@ -18,6 +18,10 @@ type PaymentRow = {
   status: string
   created_at: string
   paid_at: string | null
+  intent_symbol?: string | null
+  intent_company_name?: string | null
+  intent_report_type?: string | null
+  intent_profile?: string | null
   symbol?: string | null
   company_name?: string | null
   report_type?: string | null
@@ -46,6 +50,7 @@ type Counters = {
   failedPayments: number
   capturedPayments: number
   paidWithoutReports: number
+  paidTerminalReportsMarkedForReview: number
   legacyPendingReportsCancelled: number
   queuedWithoutRunFailed: number
   reportsSyncedFromGithub: number
@@ -59,6 +64,7 @@ function emptyCounters(): Counters {
     failedPayments: 0,
     capturedPayments: 0,
     paidWithoutReports: 0,
+    paidTerminalReportsMarkedForReview: 0,
     legacyPendingReportsCancelled: 0,
     queuedWithoutRunFailed: 0,
     reportsSyncedFromGithub: 0,
@@ -67,19 +73,22 @@ function emptyCounters(): Counters {
 }
 
 function supportsPaymentStatus(schema: SchemaInfo, status: string) {
-  // The current production schema only allows created/paid/refunded.
-  // Until the app migration expands the CHECK constraint, we avoid writing new values.
+  // Older app schemas only allowed created/paid/refunded. Detect the expanded
+  // lifecycle before writing terminal attempt statuses.
   const hasExpandedLifecycle =
     hasColumn(schema, "payments", "refund_status") ||
-    hasColumn(schema, "payments", "generation_source")
+    hasColumn(schema, "payments", "failure_reason")
   return hasExpandedLifecycle || status === "created" || status === "paid" || status === "refunded"
 }
 
 function paymentIntentColumnsAvailable(schema: SchemaInfo) {
   return (
-    hasColumn(schema, "payments", "symbol") &&
-    hasColumn(schema, "payments", "report_type") &&
-    hasColumn(schema, "payments", "profile")
+    (hasColumn(schema, "payments", "intent_symbol") &&
+      hasColumn(schema, "payments", "intent_report_type") &&
+      hasColumn(schema, "payments", "intent_profile")) ||
+    (hasColumn(schema, "payments", "symbol") &&
+      hasColumn(schema, "payments", "report_type") &&
+      hasColumn(schema, "payments", "profile"))
   )
 }
 
@@ -103,6 +112,26 @@ async function markPaymentTerminal(
       paymentId: redactId(paymentId),
       status,
     })
+    return true
+  }
+
+  if (hasColumn(schema, "payments", "failure_reason")) {
+    const timestampColumn = status === "failed" ? "failed_at" : "abandoned_at"
+    const reason =
+      status === "failed"
+        ? "Payment failed before completion."
+        : "Payment was abandoned before completion."
+    await sql.query(
+      `
+        UPDATE payments
+        SET status = $2,
+            failure_reason = COALESCE(NULLIF(failure_reason, ''), $3),
+            ${timestampColumn} = COALESCE(${timestampColumn}, NOW())
+        WHERE id = $1
+          AND status = 'created'
+      `,
+      [paymentId, status, reason],
+    )
     return true
   }
 
@@ -174,6 +203,38 @@ async function markRefundNeedsReview(
         AND status = 'paid'
     `,
     [reportId, reason],
+  )
+}
+
+async function markPaymentRefundNeedsReview(
+  sql: Sql,
+  schema: SchemaInfo,
+  env: AppEnv,
+  paymentId: string,
+  reason: string,
+) {
+  if (!hasColumn(schema, "payments", "refund_status")) return
+
+  if (env.dryRun) {
+    logInfo("dry run: would mark payment refund needs review", {
+      paymentId: redactId(paymentId),
+      reason,
+    })
+    return
+  }
+
+  await sql.query(
+    `
+      UPDATE payments
+      SET refund_status = CASE
+            WHEN COALESCE(refund_status, 'none') IN ('none', '') THEN 'needs_review'
+            ELSE refund_status
+          END,
+          refund_reason = COALESCE(NULLIF(refund_reason, ''), $2)
+      WHERE id = $1
+        AND status = 'paid'
+    `,
+    [paymentId, reason],
   )
 }
 
@@ -266,11 +327,18 @@ async function reconcilePaidPaymentsWithoutReports(
   }
 
   for (const payment of rows) {
-    if (!payment.symbol || !payment.report_type || !payment.profile) {
+    const symbol = payment.intent_symbol ?? payment.symbol
+    const companyName = payment.intent_company_name ?? payment.company_name
+    const reportType = payment.intent_report_type ?? payment.report_type
+    const profile = payment.intent_profile ?? payment.profile
+
+    if (!symbol || !reportType || !profile) {
       counters.skipped += 1
       logWarn("paid payment missing intent fields", { paymentId: redactId(payment.id) })
       continue
     }
+
+    let createdReportId: string | null = null
 
     try {
       if (env.dryRun) {
@@ -280,36 +348,94 @@ async function reconcilePaidPaymentsWithoutReports(
         continue
       }
 
-      const reportRows = (await sql.query(
-        `
-          INSERT INTO reports (user_id, symbol, company_name, report_type, profile, status, slug)
-          VALUES ($1, $2, $3, $4, $5, 'queued', $6)
-          RETURNING id
-        `,
-        [
-          payment.user_id,
-          payment.symbol,
-          payment.company_name ?? null,
-          payment.report_type,
-          payment.profile,
-          `${payment.symbol.toLowerCase()}-${payment.report_type}-${payment.id.slice(0, 8)}`,
-        ],
-      )) as { id: string }[]
+      const generationSource = payment.upgrade_from_report_id ? "upgrade" : "paid"
+      const slug = `${symbol.toLowerCase()}-${reportType}-${payment.id.slice(0, 8)}`
+      const hasGenerationSource = hasColumn(schema, "reports", "generation_source")
+
+      const reportRows = hasGenerationSource
+        ? ((await sql.query(
+            `
+              INSERT INTO reports (
+                user_id,
+                symbol,
+                company_name,
+                report_type,
+                profile,
+                status,
+                slug,
+                generation_source
+              )
+              VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7)
+              RETURNING id
+            `,
+            [
+              payment.user_id,
+              symbol,
+              companyName ?? null,
+              reportType,
+              profile,
+              slug,
+              generationSource,
+            ],
+          )) as { id: string }[])
+        : ((await sql.query(
+            `
+              INSERT INTO reports (user_id, symbol, company_name, report_type, profile, status, slug)
+              VALUES ($1, $2, $3, $4, $5, 'pending', $6)
+              RETURNING id
+            `,
+            [
+              payment.user_id,
+              symbol,
+              companyName ?? null,
+              reportType,
+              profile,
+              slug,
+            ],
+          )) as { id: string }[])
 
       const reportId = reportRows[0]?.id
       if (!reportId) {
         counters.skipped += 1
         continue
       }
+      createdReportId = reportId
 
       await sql.query("UPDATE payments SET report_id = $1 WHERE id = $2", [reportId, payment.id])
+      if (payment.upgrade_from_report_id) {
+        await sql.query("UPDATE reports SET upgraded_to = $1 WHERE id = $2", [
+          reportId,
+          payment.upgrade_from_report_id,
+        ])
+      }
+
       await dispatchReportWorkflow(env, {
         reportId,
-        symbol: payment.symbol,
-        reportType: payment.report_type,
-        profile: payment.profile,
-        companyName: payment.company_name,
+        symbol,
+        reportType,
+        profile,
+        companyName,
       })
+
+      if (hasColumn(schema, "reports", "dispatch_attempts")) {
+        await sql.query(
+          `
+            UPDATE reports
+            SET status = 'queued',
+                dispatch_attempts = dispatch_attempts + 1,
+                last_dispatch_at = NOW(),
+                dispatch_error = NULL
+            WHERE id = $1
+              AND status = 'pending'
+          `,
+          [reportId],
+        )
+      } else {
+        await sql.query(
+          "UPDATE reports SET status = 'queued' WHERE id = $1 AND status = 'pending'",
+          [reportId],
+        )
+      }
 
       logInfo("created report for paid payment", {
         paymentId: redactId(payment.id),
@@ -317,6 +443,44 @@ async function reconcilePaidPaymentsWithoutReports(
       })
     } catch (error) {
       counters.skipped += 1
+      if (!env.dryRun && createdReportId) {
+        const message = safeErrorMessage(error)
+        if (hasColumn(schema, "reports", "dispatch_error")) {
+          await sql.query(
+            `
+              UPDATE reports
+              SET status = 'failed',
+                  error = COALESCE(NULLIF(error, ''), $2),
+                  completed_at = COALESCE(completed_at, NOW()),
+                  dispatch_attempts = dispatch_attempts + 1,
+                  last_dispatch_at = NOW(),
+                  dispatch_error = $2
+              WHERE id = $1
+                AND status = 'pending'
+            `,
+            [createdReportId, message],
+          )
+        } else {
+          await sql.query(
+            `
+              UPDATE reports
+              SET status = 'failed',
+                  error = COALESCE(NULLIF(error, ''), $2),
+                  completed_at = COALESCE(completed_at, NOW())
+              WHERE id = $1
+                AND status = 'pending'
+            `,
+            [createdReportId, message],
+          )
+        }
+      }
+      await markPaymentRefundNeedsReview(
+        sql,
+        schema,
+        env,
+        payment.id,
+        "Report dispatch failed after payment",
+      )
       logWarn("failed to create report for paid payment", {
         paymentId: redactId(payment.id),
         error: safeErrorMessage(error),
@@ -403,7 +567,7 @@ async function reconcileQueuedWithoutRun(
     `
       SELECT *
       FROM reports
-      WHERE status = 'queued'
+      WHERE status IN ('pending', 'queued')
         AND gha_run_id IS NULL
         AND created_at < NOW() - ($1::int * INTERVAL '1 minute')
       ORDER BY created_at ASC
@@ -421,25 +585,41 @@ async function reconcileQueuedWithoutRun(
       continue
     }
 
-    await sql.query(
-      `
-        UPDATE reports
-        SET status = 'failed',
-            error = COALESCE(NULLIF(error, ''), 'Report generation did not start. Payment, if any, will be reviewed.'),
-            completed_at = COALESCE(completed_at, NOW()),
-            stage_progress = COALESCE(stage_progress, '{}'::jsonb) || $2::jsonb
-        WHERE id = $1
-          AND status = 'queued'
-          AND gha_run_id IS NULL
-      `,
-      [
-        report.id,
-        JSON.stringify({
-          step_label: "Generation did not start",
-          detail: "Report generation did not start. Payment, if any, will be reviewed.",
-        }),
-      ],
-    )
+    const progress = JSON.stringify({
+      step_label: "Generation did not start",
+      detail: "Report generation did not start. Payment, if any, will be reviewed.",
+    })
+
+    if (hasColumn(schema, "reports", "dispatch_error")) {
+      await sql.query(
+        `
+          UPDATE reports
+          SET status = 'failed',
+              error = COALESCE(NULLIF(error, ''), 'Report generation did not start. Payment, if any, will be reviewed.'),
+              completed_at = COALESCE(completed_at, NOW()),
+              dispatch_error = COALESCE(NULLIF(dispatch_error, ''), 'Report generation did not start.'),
+              stage_progress = COALESCE(stage_progress, '{}'::jsonb) || $2::jsonb
+          WHERE id = $1
+            AND status IN ('pending', 'queued')
+            AND gha_run_id IS NULL
+        `,
+        [report.id, progress],
+      )
+    } else {
+      await sql.query(
+        `
+          UPDATE reports
+          SET status = 'failed',
+              error = COALESCE(NULLIF(error, ''), 'Report generation did not start. Payment, if any, will be reviewed.'),
+              completed_at = COALESCE(completed_at, NOW()),
+              stage_progress = COALESCE(stage_progress, '{}'::jsonb) || $2::jsonb
+          WHERE id = $1
+            AND status IN ('pending', 'queued')
+            AND gha_run_id IS NULL
+        `,
+        [report.id, progress],
+      )
+    }
 
     await markRefundNeedsReview(sql, schema, env, report.id, "Report generation did not start")
     counters.queuedWithoutRunFailed += 1
@@ -593,6 +773,42 @@ async function reconcileStaleRunningReports(
   }
 }
 
+async function reconcilePaidTerminalReportsForRefundReview(
+  sql: Sql,
+  schema: SchemaInfo,
+  env: AppEnv,
+  counters: Counters,
+) {
+  if (!hasColumn(schema, "payments", "refund_status")) return
+
+  const rows = (await sql.query(
+    `
+      SELECT r.*
+      FROM reports r
+      JOIN payments p ON p.report_id = r.id
+      WHERE r.status IN ('failed', 'cancelled')
+        AND p.status = 'paid'
+        AND COALESCE(p.refund_status, 'none') = 'none'
+      ORDER BY r.completed_at ASC NULLS LAST, r.created_at ASC
+      LIMIT 50
+    `,
+  )) as ReportRow[]
+
+  for (const report of rows) {
+    const reason =
+      report.status === "cancelled"
+        ? "Report generation was cancelled after payment"
+        : "Report generation failed after payment"
+
+    await markRefundNeedsReview(sql, schema, env, report.id, reason)
+    counters.paidTerminalReportsMarkedForReview += 1
+    logInfo("marked paid terminal report for refund review", {
+      reportId: redactId(report.id),
+      status: report.status,
+    })
+  }
+}
+
 async function runReconciliation() {
   const env = loadEnv()
   const sql = createSql(env.databaseUrl)
@@ -613,6 +829,7 @@ async function runReconciliation() {
     await reconcileQueuedWithoutRun(sql, schema, env, counters)
     await reconcileGithubTerminalRuns(sql, schema, env, counters)
     await reconcileStaleRunningReports(sql, schema, env, counters)
+    await reconcilePaidTerminalReportsForRefundReview(sql, schema, env, counters)
     return counters
   })
 

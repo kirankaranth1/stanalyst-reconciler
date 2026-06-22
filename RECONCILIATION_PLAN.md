@@ -184,7 +184,7 @@ Free and admin reports bypass `payments` entirely and enter the report lifecycle
 /api/payment/orders
   -> create Razorpay order
   -> insert payment status=created, report_id=null
-  -> store payment intent fields: symbol, company_name, report_type, profile
+  -> store payment intent fields: intent_symbol, intent_company_name, intent_report_type, intent_profile
   -> no report row yet
 
 /api/payment/verify
@@ -198,7 +198,7 @@ Free and admin reports bypass `payments` entirely and enter the report lifecycle
 ### Payment Failed Or Dismissed
 
 ```text
-frontend calls /api/payment/abandon or /api/payment/fail
+frontend calls /api/payment/events
   -> update payment status
   -> no report row exists
   -> nothing appears as fetching in report history
