@@ -39,7 +39,7 @@ jobs:
       - name: Reconcile
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          RAZORPAY_MODE: ${{ secrets.RAZORPAY_MODE }}
+          RAZORPAY_MODE: ${{ vars.RAZORPAY_MODE }}
           RAZORPAY_LIVE_KEY_ID: ${{ secrets.RAZORPAY_LIVE_KEY_ID }}
           RAZORPAY_LIVE_KEY_SECRET: ${{ secrets.RAZORPAY_LIVE_KEY_SECRET }}
           RAZORPAY_TEST_KEY_ID: ${{ secrets.RAZORPAY_TEST_KEY_ID }}
