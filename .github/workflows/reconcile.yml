@@ -1,0 +1,54 @@
+name: Reconcile
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Trigger source"
+        required: false
+        default: "manual"
+      dry_run:
+        description: "Log planned actions without writing to the database"
+        required: false
+        default: "false"
+
+concurrency:
+  group: stanalyst-reconcile-production
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Reconcile
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          RAZORPAY_MODE: ${{ secrets.RAZORPAY_MODE }}
+          RAZORPAY_LIVE_KEY_ID: ${{ secrets.RAZORPAY_LIVE_KEY_ID }}
+          RAZORPAY_LIVE_KEY_SECRET: ${{ secrets.RAZORPAY_LIVE_KEY_SECRET }}
+          RAZORPAY_TEST_KEY_ID: ${{ secrets.RAZORPAY_TEST_KEY_ID }}
+          RAZORPAY_TEST_KEY_SECRET: ${{ secrets.RAZORPAY_TEST_KEY_SECRET }}
+          APP_GITHUB_PAT: ${{ secrets.APP_GITHUB_PAT }}
+          APP_GITHUB_OWNER: ${{ secrets.APP_GITHUB_OWNER }}
+          APP_GITHUB_REPO: ${{ secrets.APP_GITHUB_REPO }}
+          APP_GITHUB_WORKFLOW_ID: ${{ secrets.APP_GITHUB_WORKFLOW_ID }}
+          APP_GITHUB_REF: ${{ secrets.APP_GITHUB_REF }}
+          TRIGGER_SOURCE: ${{ inputs.source }}
+          RECONCILE_DRY_RUN: ${{ inputs.dry_run }}
+        run: npm run reconcile

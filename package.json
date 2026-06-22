@@ -1,0 +1,24 @@
+{
+  "name": "stanalyst-reconciler",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Reconciliation worker for Stanalyst payments and report generation state.",
+  "type": "module",
+  "scripts": {
+    "reconcile": "tsx src/reconcile.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^1.0.2",
+    "razorpay": "^2.9.6"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
+
